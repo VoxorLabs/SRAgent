@@ -40,6 +40,70 @@ ensureDir(CACHE);
 
 function log(...args) { console.log(`[sr-agent]`, ...args); }
 
+// ── Auto-publish: watch opened files for saves ──────────────────────────────
+
+const watchedFiles = new Map(); // filePath -> { id, room, timer, watcher, mtime }
+
+function watchForAutoPublish(filePath, sessionId, room) {
+  // Don't double-watch
+  if (watchedFiles.has(filePath)) {
+    const existing = watchedFiles.get(filePath);
+    existing.id = sessionId;
+    existing.room = room;
+    return;
+  }
+
+  log(`Auto-publish: watching ${filePath}`);
+  const initialMtime = fs.existsSync(filePath) ? fs.statSync(filePath).mtimeMs : 0;
+
+  const entry = { id: sessionId, room: room, timer: null, mtime: initialMtime, watcher: null };
+
+  try {
+    entry.watcher = fs.watch(path.dirname(filePath), (eventType, filename) => {
+      if (!filename || path.basename(filePath) !== filename) return;
+      if (eventType !== "change" && eventType !== "rename") return;
+
+      // Check if mtime actually changed (avoids duplicate events)
+      let newMtime = 0;
+      try { newMtime = fs.statSync(filePath).mtimeMs; } catch (_) { return; }
+      if (newMtime <= entry.mtime) return;
+      entry.mtime = newMtime;
+
+      // Debounce 3 seconds — PowerPoint may write multiple times during save
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        doAutoPublish(filePath, entry.id, entry.room);
+      }, 3000);
+    });
+
+    watchedFiles.set(filePath, entry);
+  } catch (e) {
+    log(`Auto-publish: failed to watch ${filePath}: ${e.message}`);
+  }
+}
+
+async function doAutoPublish(filePath, sessionId, room) {
+  if (!fs.existsSync(filePath)) return;
+
+  // Check file isn't locked (try to open for reading)
+  try {
+    const fd = fs.openSync(filePath, "r");
+    fs.closeSync(fd);
+  } catch (_) {
+    log(`Auto-publish: file locked, retrying in 3s...`);
+    setTimeout(() => doAutoPublish(filePath, sessionId, room), 3000);
+    return;
+  }
+
+  log(`Auto-publish: uploading ${filePath} -> ${PH_SERVER}/api/upload`);
+  try {
+    await uploadFile(filePath, sessionId, room);
+    log(`Auto-publish: success for session ${sessionId}`);
+  } catch (e) {
+    log(`Auto-publish: failed — ${e.message}`);
+  }
+}
+
 // ── Session folder resolution (same logic as old SR sidecar) ─────────────────
 
 function isShortCodeFolder(sf) {
@@ -84,6 +148,38 @@ async function resolveSessionFolder({ id, sessionFolder }) {
   } catch (_) {}
 
   return String(sessionFolder || "").trim();
+}
+
+// ── Find .pptx in Working tree (fallback for publish) ────────────────────────
+
+function findPptxRecursive(dir, hint) {
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    // If hint provided, look for folder matching hint first
+    if (hint) {
+      for (const e of entries) {
+        if (e.isDirectory() && e.name === hint) {
+          const pptx = path.join(dir, e.name, `${e.name}.pptx`);
+          if (fs.existsSync(pptx)) return pptx;
+        }
+      }
+    }
+    // Scan subdirs for any .pptx (most recently modified)
+    let best = null;
+    let bestMtime = 0;
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        const sub = path.join(dir, e.name);
+        const files = fs.readdirSync(sub).filter(f => f.endsWith(".pptx"));
+        for (const f of files) {
+          const fp = path.join(sub, f);
+          const mt = fs.statSync(fp).mtimeMs;
+          if (mt > bestMtime) { best = fp; bestMtime = mt; }
+        }
+      }
+    }
+    return best;
+  } catch (_) { return null; }
 }
 
 // ── Download file from PHV2 ──────────────────────────────────────────────────
@@ -207,7 +303,7 @@ const server = http.createServer(async (req, res) => {
 
   // GET /health
   if (req.method === "GET" && req.url === "/health") {
-    return json(res, 200, { ok: true, agent: "sr-micro", port: PORT, server: PH_SERVER, working: WORKING });
+    return json(res, 200, { ok: true, agent: "sr-micro", port: PORT, server: PH_SERVER, working: WORKING, watching: watchedFiles.size });
   }
 
   // GET /config
@@ -252,6 +348,9 @@ const server = http.createServer(async (req, res) => {
       log(`Opening: ${dest}`);
       spawn("cmd.exe", ["/c", "start", "", dest], { detached: true, stdio: "ignore" }).unref();
 
+      // Start watching for auto-publish on save
+      watchForAutoPublish(dest, id, room);
+
       return json(res, 200, { ok: true, path: dest, sessionFolder: sfFinal, fileName: canonicalName });
     } catch (e) {
       log("OPEN ERROR:", e.message);
@@ -265,26 +364,39 @@ const server = http.createServer(async (req, res) => {
       const body = await parseBody(req);
       const { id, room, sessionFolder, fileName } = body;
 
-      if (!id || !room) return json(res, 400, { ok: false, error: "Missing id or room" });
+      if (!id) return json(res, 400, { ok: false, error: "Missing id" });
 
       const sfResolved = await resolveSessionFolder({ id, sessionFolder });
       let sfFinal = sfResolved || "";
       if (!sfFinal || isShortCodeFolder(sfFinal)) {
         sfFinal = fileName ? path.parse(fileName).name : "";
       }
-      if (!sfFinal) return json(res, 400, { ok: false, error: "Cannot determine session folder" });
 
-      const canonicalName = `${sfFinal}.pptx`;
-      const localPath = path.join(WORKING, room, sfFinal, canonicalName);
+      // Try canonical path first
+      let localPath = "";
+      if (sfFinal && room) {
+        const canonicalName = `${sfFinal}.pptx`;
+        localPath = path.join(WORKING, room, sfFinal, canonicalName);
+      }
 
-      if (!fs.existsSync(localPath)) {
-        return json(res, 404, { ok: false, error: "Working file not found", path: localPath });
+      // If not found, scan Working/ for any .pptx matching the session folder name
+      if (!localPath || !fs.existsSync(localPath)) {
+        localPath = "";
+        const searchRoot = room ? path.join(WORKING, room) : WORKING;
+        if (fs.existsSync(searchRoot)) {
+          const found = findPptxRecursive(searchRoot, sfFinal);
+          if (found) localPath = found;
+        }
+      }
+
+      if (!localPath || !fs.existsSync(localPath)) {
+        return json(res, 404, { ok: false, error: "Working file not found. Open the file first, then publish after editing." });
       }
 
       log(`Publishing ${localPath} -> ${PH_SERVER}/api/upload`);
-      const result = await uploadFile(localPath, id, room);
+      const result = await uploadFile(localPath, id, room || "");
 
-      return json(res, 200, { ok: true, result });
+      return json(res, 200, { ok: true, result, path: localPath });
     } catch (e) {
       log("PUBLISH ERROR:", e.message);
       return json(res, 500, { ok: false, error: e.message });
@@ -344,4 +456,11 @@ server.listen(PORT, () => {
   log(`Working folder: ${WORKING}`);
   log(`Active room: ${activeRoom || "(none — will track from requests)"}`);
   if (activeRoom) setTimeout(sendHeartbeat, 2000);
+
+  // Open Speaker Ready and Presenter Self-Service pages in default browser
+  setTimeout(() => {
+    spawn("cmd.exe", ["/c", "start", "", `${PH_SERVER}/speakerready.html`], { detached: true, stdio: "ignore" }).unref();
+    spawn("cmd.exe", ["/c", "start", "", `${PH_SERVER}/presenter-lookup.html`], { detached: true, stdio: "ignore" }).unref();
+    log("Opened Speaker Ready and Presenter Self-Service in browser");
+  }, 3000);
 });
