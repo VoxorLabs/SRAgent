@@ -113,13 +113,15 @@ function isShortCodeFolder(sf) {
 async function fetchJson(url) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith("https") ? https : http;
-    mod.get(url, { headers: { "Cache-Control": "no-cache" } }, (res) => {
+    const req = mod.get(url, { headers: { "Cache-Control": "no-cache" }, timeout: 15000 }, (res) => {
       let data = "";
       res.on("data", (c) => data += c);
       res.on("end", () => {
         try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
       });
-    }).on("error", reject);
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Request timeout")); });
   });
 }
 
@@ -189,7 +191,7 @@ function downloadFile(url, dest) {
     ensureDir(path.dirname(dest));
     const file = fs.createWriteStream(dest);
     const mod = url.startsWith("https") ? https : http;
-    mod.get(url, (res) => {
+    const req = mod.get(url, { timeout: 60000 }, (res) => {
       if (res.statusCode === 302 || res.statusCode === 301) {
         // Follow redirect
         file.close();
@@ -203,11 +205,13 @@ function downloadFile(url, dest) {
       }
       res.pipe(file);
       file.on("finish", () => { file.close(); resolve(); });
-    }).on("error", (e) => {
+    });
+    req.on("error", (e) => {
       file.close();
       try { fs.unlinkSync(dest); } catch (_) {}
       reject(e);
     });
+    req.on("timeout", () => { req.destroy(); });
   });
 }
 
@@ -273,18 +277,28 @@ function uploadFile(filePath, sessionId, room) {
 
 // ── HTTP Server ──────────────────────────────────────────────────────────────
 
+const MAX_BODY = 1024 * 1024; // 1 MB
+
 function parseBody(req) {
   return new Promise((resolve) => {
     let data = "";
-    req.on("data", (c) => data += c);
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > MAX_BODY) { req.destroy(); resolve({}); return; }
+      data += c;
+    });
     req.on("end", () => {
       try { resolve(JSON.parse(data)); } catch (_) { resolve({}); }
     });
   });
 }
 
-function cors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+function cors(res, req) {
+  // Restrict to localhost and PHV2 server
+  const origin = (req && req.headers && req.headers.origin) || "";
+  const allowed = origin.startsWith("http://localhost") || origin.startsWith("http://127.0.0.1") || origin.startsWith(PH_SERVER);
+  res.setHeader("Access-Control-Allow-Origin", allowed ? origin : `http://localhost:${PORT}`);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
@@ -296,7 +310,7 @@ function json(res, status, obj) {
 }
 
 const server = http.createServer(async (req, res) => {
-  cors(res);
+  cors(res, req);
 
   // CORS preflight
   if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
@@ -441,9 +455,10 @@ async function sendHeartbeat() {
         ...(AGENT_TOKEN ? { "X-Agent-Token": AGENT_TOKEN } : {}),
       },
     }, () => {});
-    req.on("error", () => {});
+    req.on("error", (e) => { log(`heartbeat failed: ${e.message}`); });
+    req.setTimeout(10000, () => { req.destroy(); });
     req.end(body);
-  } catch (_) {}
+  } catch (e) { log(`heartbeat error: ${e.message}`); }
 }
 
 setInterval(sendHeartbeat, 10000);
